@@ -19,17 +19,19 @@ module ICache (
 
 `ifdef ENABLE_ICACHE
 
-    localparam NLINES = 32;
-    localparam NWORDS = 8;
+    localparam NLINES    = 32;
+    localparam NWORDS    = 8;
+    localparam RAM_DEPTH = NLINES * NWORDS;
 
-    reg              ic_valid [0:NLINES-1];
-    reg [21:0]       ic_tag   [0:NLINES-1];
-    reg [31:0]       ic_data  [0:NLINES-1][0:NWORDS-1];
+    reg [NLINES-1:0] ic_valid;
+    (* ram_style = "distributed" *) reg [21:0] ic_tag  [0:NLINES-1];
+    (* ram_style = "block" *)       reg [31:0] ic_data [0:RAM_DEPTH-1];
 
     wire [21:0] a_tag = inst_addr[31:10];
     wire [ 4:0] a_idx = inst_addr[ 9: 5];
     wire [ 2:0] a_off = inst_addr[ 4: 2];
     wire        a_hit = ic_valid[a_idx] & (ic_tag[a_idx] == a_tag);
+    wire [ 7:0] a_ram_addr = {a_idx, a_off};
 
     reg  [31:0] redir_addr;
     reg         redir_pending;
@@ -48,19 +50,34 @@ module ICache (
     localparam S_DONE = 2'd3;
     localparam REFILL = S_FILL;
 
+    reg [ 1:0] state;
     wire [1:0] current_state = state;
 
-    reg [ 1:0] state;
     reg [ 2:0] fill_cnt;
     reg [ 2:0] s_off;
     reg [ 4:0] s_idx;
     reg [21:0] s_tag;
     reg [31:0] s_blk;
+    reg [31:0] ic_rd_data;
+    reg [31:0] fill_pick_data;
+    reg        done_from_fill;
 
     wire saved_hit      = ic_valid[s_idx] & (ic_tag[s_idx] == s_tag);
     wire fill_abort_now = fill_abort | pred_error;
+    wire ic_fill_we     = (state == S_FILL) & dev_rvalid & !fill_abort_now;
+    wire ic_fill_last   = ic_fill_we & (fill_cnt == NWORDS - 1);
+    wire [7:0] ic_fill_addr = {s_idx, fill_cnt};
+    wire [7:0] ic_ram_raddr = (state == S_IDLE) ? a_ram_addr :
+        ((((state == S_WAIT) || (state == S_DONE)) && pred_error) ? a_ram_addr : {s_idx, s_off});
 
-    integer k;
+    always @(posedge cpu_clk) begin
+        ic_rd_data <= ic_data[ic_ram_raddr];
+        if (ic_fill_we)
+            ic_data[ic_fill_addr] <= dev_rdata;
+        if (ic_fill_last)
+            ic_tag[s_idx] <= s_tag;
+    end
+
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             state         <= S_IDLE;
@@ -70,8 +87,9 @@ module ICache (
             inst_out      <= 32'h0;
             redir_pending <= 1'b0;
             fill_abort    <= 1'b0;
-            for (k = 0; k < NLINES; k = k + 1)
-                ic_valid[k] <= 1'b0;
+            fill_pick_data <= 32'h0;
+            done_from_fill <= 1'b0;
+            ic_valid      <= {NLINES{1'b0}};
         end else begin
             inst_valid <= 1'b0;
             ren0       <= 1'b0;
@@ -85,7 +103,8 @@ module ICache (
                         s_blk <= {inst_addr[31:5], 5'h0};
 
                         if (a_hit) begin
-                            state <= S_DONE;
+                            done_from_fill <= 1'b0;
+                            state          <= S_DONE;
                         end else if (dev_rrdy) begin
                             ren0          <= 1'b1;
                             cpu_raddr     <= {inst_addr[31:5], 5'h0};
@@ -107,7 +126,8 @@ module ICache (
                         s_blk <= {inst_addr[31:5], 5'h0};
 
                         if (a_hit) begin
-                            state <= S_DONE;
+                            done_from_fill <= 1'b0;
+                            state          <= S_DONE;
                         end else if (dev_rrdy) begin
                             ren0          <= 1'b1;
                             cpu_raddr     <= {inst_addr[31:5], 5'h0};
@@ -119,7 +139,8 @@ module ICache (
                             state <= S_WAIT;
                         end
                     end else if (saved_hit) begin
-                        state <= S_DONE;
+                        done_from_fill <= 1'b0;
+                        state          <= S_DONE;
                     end else if (dev_rrdy) begin
                         ren0          <= 1'b1;
                         cpu_raddr     <= s_blk;
@@ -138,13 +159,13 @@ module ICache (
                     end
 
                     if (dev_rvalid) begin
-                        if (!fill_abort_now)
-                            ic_data[s_idx][fill_cnt] <= dev_rdata;
+                        if (!fill_abort_now && (fill_cnt == s_off))
+                            fill_pick_data <= dev_rdata;
 
                         if (fill_cnt == NWORDS - 1) begin
                             if (!fill_abort_now) begin
                                 ic_valid[s_idx] <= 1'b1;
-                                ic_tag  [s_idx] <= s_tag;
+                                done_from_fill  <= 1'b1;
                                 state           <= S_DONE;
                             end else begin
                                 s_off <= pred_error ? a_off : r_off;
@@ -170,7 +191,8 @@ module ICache (
                         s_blk <= {inst_addr[31:5], 5'h0};
 
                         if (a_hit) begin
-                            state <= S_DONE;
+                            done_from_fill <= 1'b0;
+                            state          <= S_DONE;
                         end else if (dev_rrdy) begin
                             ren0          <= 1'b1;
                             cpu_raddr     <= {inst_addr[31:5], 5'h0};
@@ -183,7 +205,7 @@ module ICache (
                         end
                     end else begin
                         inst_valid <= 1'b1;
-                        inst_out   <= ic_data[s_idx][s_off];
+                        inst_out   <= done_from_fill ? fill_pick_data : ic_rd_data;
                         state      <= S_IDLE;
                     end
                 end

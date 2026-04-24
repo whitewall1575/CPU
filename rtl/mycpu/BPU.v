@@ -6,15 +6,6 @@
 `define BHT_ENTRY (1 << `BHT_IDX_W)    // 1024 项
 `define BHT_TAG_W 8
 
-// ============================================================
-//  Branch Prediction Unit — 大道至简（稳定最终版）
-//
-//  核心思想：
-//  1. 放弃脆弱的 IF 阶段投机更新，回归坚如磐石的 EX 阶段真实更新。
-//  2. 完全免疫 Cache Miss、Load-Use 等导致的流水线冲刷污染。
-//  3. 增加 ras_sp != 0 的防溢出保护。
-// ============================================================
-
 module BPU (
     input  wire         cpu_clk    ,
     input  wire         cpu_rstn   ,
@@ -41,17 +32,16 @@ module BPU (
     // --------------------------------------------------------
     //  BHT / BTB 存储
     // --------------------------------------------------------
-    reg [`BHT_TAG_W-1:0] tag      [`BHT_ENTRY-1:0];
+    (* ram_style = "distributed" *) reg [`BHT_TAG_W-1:0] tag     [`BHT_ENTRY-1:0];
     reg [`BHT_ENTRY-1:0] valid;
-    reg [           1:0] history  [`BHT_ENTRY-1:0];
-    reg [          31:0] target   [`BHT_ENTRY-1:0];
-    reg [`BHT_ENTRY-1:0] btb_is_ret;
-    reg [`BHT_ENTRY-1:0] btb_is_call;
+    (* ram_style = "distributed" *) reg [1:0]  history [`BHT_ENTRY-1:0];
+    (* ram_style = "distributed" *) reg [31:0] target  [`BHT_ENTRY-1:0];
+    (* ram_style = "distributed" *) reg        btb_is_ret [`BHT_ENTRY-1:0];
 
     // --------------------------------------------------------
     //  RAS (纯架构级状态，毫无投机污染)
     // --------------------------------------------------------
-    reg [31:0] ras [0:15];
+    (* ram_style = "distributed" *) reg [31:0] ras [0:15];
     reg [ 3:0] ras_sp;
 
     // --------------------------------------------------------
@@ -114,18 +104,14 @@ module BPU (
     wire add_entry    = ex_advance & ex_is_bj & (!valid[ex_index] | (tag[ex_index] != ex_tag));
     wire update_entry = ex_advance & ex_is_bj &  valid[ex_index] & (tag[ex_index] == ex_tag);
 
-    integer i;
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             ras_sp     <= 4'd0;
             valid      <= {`BHT_ENTRY{1'b0}};
-            btb_is_ret <= {`BHT_ENTRY{1'b0}};
-            for (i = 0; i < `BHT_ENTRY; i = i + 1) history[i] <= 2'b10;
         end else if (ex_advance) begin
             
             // 💡 1. 真实 RAS 更新 (不搞投机，稳如老狗)
             if (ex_is_call & real_taken & ras_sp != 4'd15) begin
-                ras[ras_sp] <= ex_pc + 32'd4;
                 ras_sp      <= ras_sp + 1;
             end else if (ex_is_ret & real_taken & ras_sp != 4'd0) begin
                 ras_sp      <= ras_sp - 1;
@@ -134,22 +120,31 @@ module BPU (
             // 💡 2. 真实 BTB 更新
             if (add_entry) begin
                 valid[ex_index]       <= 1'b1;
+            end
+        end
+    end
+
+    always @(posedge cpu_clk) begin
+        if (cpu_rstn && ex_advance) begin
+            if (ex_is_call & real_taken & ras_sp != 4'd15)
+                ras[ras_sp] <= ex_pc + 32'd4;
+
+            if (add_entry) begin
                 tag[ex_index]         <= ex_tag;
                 history[ex_index]     <= real_taken ? 2'b10 : 2'b01;
                 target[ex_index]      <= real_target;
                 btb_is_ret[ex_index]  <= ex_is_ret;
-                btb_is_call[ex_index] <= ex_is_call;
             end else if (update_entry) begin
                 case (history[ex_index])
                     2'b00: history[ex_index] <= real_taken ? 2'b01 : 2'b00;
                     2'b01: history[ex_index] <= real_taken ? 2'b10 : 2'b00;
                     2'b10: history[ex_index] <= real_taken ? 2'b11 : 2'b01;
                     2'b11: history[ex_index] <= real_taken ? 2'b11 : 2'b10;
+                    default: history[ex_index] <= real_taken ? 2'b10 : 2'b01;
                 endcase
                 if (real_taken)
                     target[ex_index] <= real_target;
                 btb_is_ret[ex_index]  <= ex_is_ret;
-                btb_is_call[ex_index] <= ex_is_call;
             end
         end
     end

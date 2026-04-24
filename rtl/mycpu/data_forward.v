@@ -55,15 +55,15 @@ module data_forward (
     // =========================================================================
     // 前递数据选择
     // =========================================================================
-    assign fd_rD1_sel = raw_rR1_id_ex | raw_rR1_id_mem | raw_rR1_id_wb;
-    assign fd_rD2_sel = raw_rR2_id_ex | raw_rR2_id_mem | raw_rR2_id_wb;
+    assign fd_rD1_sel = (raw_rR1_id_ex & !ex_sel_ram) | raw_rR1_id_mem | raw_rR1_id_wb;
+    assign fd_rD2_sel = (raw_rR2_id_ex & !ex_sel_ram) | raw_rR2_id_mem | raw_rR2_id_wb;
 
     // rR1 前递数据选择（优先级：EX > MEM > WB）
     // 注意：当 Load-Use 时，EX 阶段的数据无效，需要等待 MEM 阶段
     // 但由于插入了气泡，下一拍时原 EX 的 Load 已进入 MEM，自然通过 MEM 前递
     always @(*) begin
         if      (id_rR1 == 5'h0)  fd_rD1 = 32'h0;
-        else if (raw_rR1_id_ex )  fd_rD1 = ex_wd;   // EX 阶段前递（Load-Use 时会被气泡延迟）
+        else if (raw_rR1_id_ex & !ex_sel_ram)  fd_rD1 = ex_wd;   // EX 阶段前递（非Load）
         else if (raw_rR1_id_mem)  fd_rD1 = mem_wd;  // MEM 阶段前递
         else if (raw_rR1_id_wb )  fd_rD1 = wb_wd;   // WB 阶段前递
         else                      fd_rD1 = 32'h0;
@@ -72,7 +72,7 @@ module data_forward (
     // rR2 前递数据选择
     always @(*) begin
         if      (id_rR2 == 5'h0)  fd_rD2 = 32'h0;
-        else if (raw_rR2_id_ex )  fd_rD2 = ex_wd;
+        else if (raw_rR2_id_ex & !ex_sel_ram)  fd_rD2 = ex_wd;
         else if (raw_rR2_id_mem)  fd_rD2 = mem_wd;
         else if (raw_rR2_id_wb )  fd_rD2 = wb_wd;
         else                      fd_rD2 = 32'h0;
