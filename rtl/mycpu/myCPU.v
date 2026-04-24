@@ -104,22 +104,8 @@ module myCPU (
 
 
     wire        pl_suspend    = ldst_suspend | muldiv_suspend;       // 流水线暂停信号
-    // ==========================================================================
-    // Load-Use 冒险处理（改进版）
-    // 
-    // 原方案：每次 Load 指令都暂停取指直到访存完成
-    // 新方案：仅当检测到 Load-Use 冒险时插入 1 个气泡
-    //
-    // 工作原理：
-    // 1. 当 ID 阶段指令依赖 EX 阶段的 Load 结果时，load_use = 1
-    // 2. load_use_stall 暂停 IF/ID 阶段 1 拍，同时向 EX 阶段插入气泡
-    // 3. 下一拍，Load 进入 MEM 阶段，数据准备好后通过 MEM→ID 前递
-    // ==========================================================================
-    // Load-Use 冒险检测（暂时禁用，用于调试）
-    // wire        load_use_stall = load_use & id_valid & !pl_suspend;
-    wire        load_use_stall = 1'b0;  // 禁用 Load-Use 气泡，回退到原始行为
+    wire        load_use_stall = 1'b0;
     
-    // 出现多周期指令(访存、乘除法)暂停取指, 多周期操作结束后继续取指
     wire        pause_ifetch  = ((ldst_suspend | id_is_ld_st | ex_is_ld_st) & !ldst_done) | 
                                 ((muldiv_suspend | id_is_muldiv) & !muldiv_done);
     wire        resume_ifetch = ldst_done | muldiv_done;          // 恢复取指

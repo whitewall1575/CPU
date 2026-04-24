@@ -2,27 +2,6 @@
 
 `include "defines.vh"
 
-// =============================================================
-//  L1 Data Cache
-//
-//  Parameters:  (same geometry as ICache)
-//    Capacity  : 1 KB
-//    Block     : 256 bit = 32 B = 8 x 32-bit words
-//    Mapping   : Direct-mapped
-//    Lines     : 32
-//
-//  Write policy: Write-through + No-write-allocate
-//    Read  hit : return from cache (0 extra cycles)
-//    Read  miss: fetch whole block (8 words), fill cache, return
-//    Write hit : update cache word + write to memory
-//    Write miss: write to memory only (no block allocation)
-//
-//  Peripheral access (0xBFAFxxxx):
-//    Read/Write bypasses cache and goes directly to the bus
-//
-//  Requires: cache_rreq_bridge with BLK_LEN = 8
-// =============================================================
-
 module DCache (
     input  wire         cpu_rstn,
     input  wire         cpu_clk,
@@ -50,19 +29,21 @@ module DCache (
 
 `ifdef ENABLE_DCACHE
 
-    localparam NLINES = 32;
-    localparam NWORDS = 8;
+    localparam NLINES    = 32;
+    localparam NWORDS    = 8;
+    localparam RAM_DEPTH = NLINES * NWORDS;
     localparam PERI_SEG = 16'hBFAF;
 
-    reg              dc_valid [0:NLINES-1];
-    reg [21:0]       dc_tag   [0:NLINES-1];
-    reg [31:0]       dc_data  [0:NLINES-1][0:NWORDS-1];
+    reg [NLINES-1:0] dc_valid;
+    (* ram_style = "distributed" *) reg [21:0] dc_tag  [0:NLINES-1];
+    (* ram_style = "block" *)       reg [31:0] dc_data [0:RAM_DEPTH-1];
 
     wire        cacheable = (data_addr[31:16] != PERI_SEG);
     wire [21:0] a_tag     = data_addr[31:10];
     wire [ 4:0] a_idx     = data_addr[ 9: 5];
     wire [ 2:0] a_off     = data_addr[ 4: 2];
     wire        d_hit     = cacheable & dc_valid[a_idx] & (dc_tag[a_idx] == a_tag);
+    wire [ 7:0] a_ram_addr = {a_idx, a_off};
 
     localparam RS_IDLE = 2'd0;
     localparam RS_WAIT = 2'd1;
@@ -70,15 +51,18 @@ module DCache (
     localparam RS_DONE = 2'd3;
     localparam REFILL = RS_FILL;
 
+    reg [ 1:0] rs;
     wire [1:0] current_state = rs;
 
-    reg [ 1:0] rs;
     reg [ 2:0] r_fcnt;
     reg [ 2:0] r_off;
     reg [ 4:0] r_idx;
     reg [21:0] r_tag;
     reg [31:0] r_base_addr;
     reg        r_is_peri;
+    reg [31:0] dc_rd_data;
+    reg [31:0] r_pick_data;
+    reg        r_done_from_fill;
 
     reg r_ren0;
     always @(*) cpu_ren = {4{r_ren0}};
@@ -93,8 +77,29 @@ module DCache (
     reg [31:0] w_data_r;
 
     wire wr_resp = dev_wrdy & (cpu_wen == 4'h0);
+    wire dc_fill_we   = (rs == RS_FILL) & dev_rvalid & !r_is_peri;
+    wire dc_fill_last = dc_fill_we & (r_fcnt == NWORDS - 1);
+    wire [7:0] dc_fill_addr = {r_idx, r_fcnt};
+    wire dc_store_we = (ws == WS_IDLE) & (|data_wen) & d_hit;
+    wire [7:0] dc_store_addr = {a_idx, a_off};
+    wire dc_data_we = dc_fill_we | dc_store_we;
+    wire [7:0] dc_data_waddr = dc_fill_we ? dc_fill_addr : dc_store_addr;
+    wire [31:0] dc_data_wdata = dc_fill_we ? dev_rdata : data_wdata;
+    wire [3:0] dc_data_wen = dc_fill_we ? 4'hf : data_wen;
+    wire [7:0] dc_ram_raddr = (rs == RS_IDLE) ? a_ram_addr : {r_idx, r_off};
 
-    integer k;
+    always @(posedge cpu_clk) begin
+        dc_rd_data <= dc_data[dc_ram_raddr];
+        if (dc_data_we) begin
+            if (dc_data_wen[0]) dc_data[dc_data_waddr][ 7: 0] <= dc_data_wdata[ 7: 0];
+            if (dc_data_wen[1]) dc_data[dc_data_waddr][15: 8] <= dc_data_wdata[15: 8];
+            if (dc_data_wen[2]) dc_data[dc_data_waddr][23:16] <= dc_data_wdata[23:16];
+            if (dc_data_wen[3]) dc_data[dc_data_waddr][31:24] <= dc_data_wdata[31:24];
+        end
+        if (dc_fill_last)
+            dc_tag[r_idx] <= r_tag;
+    end
+
     always @(posedge cpu_clk or negedge cpu_rstn) begin
         if (!cpu_rstn) begin
             rs         <= RS_IDLE;
@@ -104,8 +109,9 @@ module DCache (
             data_valid <= 1'b0;
             data_wresp <= 1'b0;
             cpu_wen    <= 4'h0;
-            for (k = 0; k < NLINES; k = k + 1)
-                dc_valid[k] <= 1'b0;
+            r_pick_data <= 32'h0;
+            r_done_from_fill <= 1'b0;
+            dc_valid  <= {NLINES{1'b0}};
         end else begin
             data_valid <= 1'b0;
             data_wresp <= 1'b0;
@@ -118,6 +124,7 @@ module DCache (
                         if (d_hit) begin
                             r_off <= a_off;
                             r_idx <= a_idx;
+                            r_done_from_fill <= 1'b0;
                             rs    <= RS_DONE;
                         end else begin
                             r_off       <= a_off;
@@ -154,12 +161,13 @@ module DCache (
                             data_rdata <= dev_rdata;
                             rs         <= RS_IDLE;
                         end else begin
-                            dc_data[r_idx][r_fcnt] <= dev_rdata;
+                            if (r_fcnt == r_off)
+                                r_pick_data <= dev_rdata;
 
                             if (r_fcnt == NWORDS - 1) begin
-                                dc_valid[r_idx] <= 1'b1;
-                                dc_tag  [r_idx] <= r_tag;
-                                rs              <= RS_DONE;
+                                dc_valid[r_idx]    <= 1'b1;
+                                r_done_from_fill   <= 1'b1;
+                                rs                 <= RS_DONE;
                             end else begin
                                 r_fcnt <= r_fcnt + 3'h1;
                             end
@@ -169,21 +177,17 @@ module DCache (
 
                 RS_DONE: begin
                     data_valid <= 1'b1;
-                    data_rdata <= dc_data[r_idx][r_off];
+                    data_rdata <= r_done_from_fill ? r_pick_data : dc_rd_data;
                     rs         <= RS_IDLE;
+                end
+                default: begin
+                    rs <= RS_IDLE;
                 end
             endcase
 
             case (ws)
                 WS_IDLE: begin
                     if (|data_wen) begin
-                        if (d_hit) begin
-                            if (data_wen[0]) dc_data[a_idx][a_off][ 7: 0] <= data_wdata[ 7: 0];
-                            if (data_wen[1]) dc_data[a_idx][a_off][15: 8] <= data_wdata[15: 8];
-                            if (data_wen[2]) dc_data[a_idx][a_off][23:16] <= data_wdata[23:16];
-                            if (data_wen[3]) dc_data[a_idx][a_off][31:24] <= data_wdata[31:24];
-                        end
-
                         w_addr_r <= data_addr;
                         w_data_r <= data_wdata;
                         w_wen_r  <= data_wen;
@@ -212,6 +216,9 @@ module DCache (
                     data_wresp <= wr_resp;
                     if (wr_resp)
                         ws <= WS_IDLE;
+                end
+                default: begin
+                    ws <= WS_IDLE;
                 end
             endcase
         end
@@ -331,7 +338,5 @@ module DCache (
 `endif
 
 endmodule
-
-
 
 
